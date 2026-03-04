@@ -264,6 +264,7 @@ class HeatLogicEngine:
 
             actual_rows = daily_raw_counts.get(day, 0)
             completeness = round((actual_rows / Config.EXPECTED_ROWS_PER_DAY) * 100, 2)
+            data_loss = round(100.0 - completeness, 2)
 
             results.append({
                 "date":              day.isoformat(),
@@ -275,6 +276,7 @@ class HeatLogicEngine:
                 "env_stress":        env_stress,
                 "in_expected_window": in_window,
                 "completeness_pct":  completeness,
+                "data_loss_pct":     data_loss,
                 "was_filled":        day in filled_days
             })
 

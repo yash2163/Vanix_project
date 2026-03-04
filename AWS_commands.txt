@@ -1,0 +1,4 @@
+1.  aws ecr get-login-password --region ap-south-2 | docker login --username AWS --password-stdin 643492881003.dkr.ecr.ap-south-2.amazonaws.com && \
+docker build --provenance=false --platform linux/amd64 -t heat-cycle-benchmark:daily-analysis-v2 . && \
+docker tag heat-cycle-benchmark:daily-analysis-v2 643492881003.dkr.ecr.ap-south-2.amazonaws.com/heat-cycle-benchmark:daily-analysis-v2 && \
+docker push 643492881003.dkr.ecr.ap-south-2.amazonaws.com/heat-cycle-benchmark:daily-analysis-v2
