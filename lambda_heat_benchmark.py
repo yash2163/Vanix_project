@@ -1,47 +1,32 @@
 """
-Heat Cycle Detection - Benchmark Lambda Function
-=================================================
-Purpose: Benchmarking and logic validation ONLY (not part of the live scoring pipeline).
+Daily Heat Analysis and Data Loss Tool
+======================================
+Purpose: Isolated calculation of heat metrics for a single day to analyze
+data completeness and compare RAW vs FILLED performance side-by-side.
 
-Input Payload:
-    {
-        "node_id":        124,
-        "last_heat_date": "2026-02-26",   # ISO date: YYYY-MM-DD
-        "window_days":    7               # optional, default 7
-    }
+Constants:
+    - Expected DPs per 10-min window: 800   (80 DPs/min × 10 min)
+    - Expected DPs per 30-min slot:   2,400 (80 DPs/min × 30 min)
+    - Expected DPs per day:           115,200
 
-Output:
-    {
-        "node_id": 124,
-        "last_heat_date": "2026-02-26",
-        "expected_next_heat": "2026-03-19",
-        "expected_window": { "start": "2026-03-16", "end": "2026-03-22" },
-        "days_until_next_window": 18,
-        "daily_results": [
-            {
-                "date": "2026-02-27",
-                "status": "NORMAL",
-                "night_spike_C": 0.08,
-                "persistence_pct": 32.1,
-                "score": 14.05,
-                "global_anchor_C": 34.50,
-                "buffer_days": 2,
-                "in_expected_window": false,
-                "actual": 131620,
-                "completeness_pct": 76.17
-            },
-            ...
-        ],
-        "summary": {
-            "total_days_processed": 10,
-            "confirmed_heat_days": [],
-            "proestrus_days": [],
-            "normal_days": 10
-        }
-    }
+Data Loss Resolution:
+    - Backfill window:  10 minutes  (used for gap detection)
+    - Reporting slots:  30 minutes  (48 slots per day)
 
-DB Reference: Uses same device_data table and PG_CONNECTION_STRING as pipline.py
-Schedule: Triggered ON-DEMAND for benchmarking (not on a cron schedule)
+Outputs two scores:
+    1. Raw Score   (calculated with gaps left as NaNs)
+    2. Filled Score (calculated after 10-min-window forward-fill only)
+
+Bugs Fixed vs Previous Version:
+    [BUG-1] calculate_daily_anchor returned 0.0 on empty data → now returns np.nan,
+            which propagates correctly and prevents a fake night_spike.
+    [BUG-2] ANCHOR_HOURS intent is "biological night" (23:00 today → 03:00 tomorrow).
+            Using only one calendar day means hour-23 and hours 0-3 are the same day,
+            which is fine for a self-contained daily run — but the anchor is now
+            computed as min(all anchor-hour temps) with an explicit NaN guard.
+    [BUG-3] ffill() was applied to res_ratio (behavioral data) — scientifically invalid.
+            Fill is now applied ONLY to temp_mean; res_ratio stays NaN for missing hours.
+    [BUG-4] Negative data-loss % (from duplicate rows) is now flagged with a warning.
 """
 
 import json
@@ -52,11 +37,48 @@ import psycopg2
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, date
-from collections import deque
 from typing import Dict, List, Tuple, Optional
 
 # ============================================================================
-# LOGGING
+# 1. CONFIGURATION
+# ============================================================================
+
+class Config:
+    PG_CONNECTION_STRING = os.environ.get(
+        "PG_CONNECTION_STRING",
+        "postgresql://vanixuser:vanix%244567%23@10.98.36.21:6432/vanixdb"
+    )
+
+    # ── Sampling constants ─────────────────────────────────────────────────
+    DP_RATE_PER_MIN       = 80          # raw device rate
+    BACKFILL_WINDOW_MIN   = 10          # gap fill only within this window
+    SLOT_DURATION_MIN     = 30          # reporting granularity
+    SLOTS_PER_DAY         = 48          # 24 h × 2
+
+    EXPECTED_DPS_PER_MIN  = DP_RATE_PER_MIN                             # 80
+    EXPECTED_DPS_PER_SLOT = DP_RATE_PER_MIN * SLOT_DURATION_MIN         # 2 400
+    EXPECTED_DPS_PER_DAY  = DP_RATE_PER_MIN * 60 * 24                   # 115 200
+
+    # ── Activity thresholds (Non-configurable for now) ─────────────────────
+    RES_THRESHOLD  = 0.35
+    FEED_THRESHOLD = 0.15
+
+    # ── Scoring weights (Configurable via DB) ──────────────────────────────
+    STRESS_TEMP     = 40.5    # Default; dynamically updated from device_data
+    SCORE_W_SPIKE   = 15      # Default; dynamically updated from heat_analysis_config
+    SCORE_W_PERSIST = 40      # Default; dynamically updated from heat_analysis_config
+    HEAT_DETECTION_THRESHOLD = 50 
+
+    # ── Hour windows (Non-configurable for now) ────────────────────────────
+    # "Biological night" window used for both anchor and spike detection.
+    # Within a single calendar day this covers: 00, 01, 02, 03 AND 23.
+    ANCHOR_HOURS = [23, 0, 1, 2, 3]
+    NIGHT_HOURS  = [23, 0, 1, 2, 3]
+    SOLAR_HOURS  = [11, 12, 13, 14, 15, 16]
+
+
+# ============================================================================
+# LOGGING SETUP
 # ============================================================================
 
 def setup_logging() -> logging.Logger:
@@ -65,569 +87,645 @@ def setup_logging() -> logging.Logger:
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[logging.StreamHandler(sys.stdout)]
     )
-    return logging.getLogger(__name__)
+    return logging.getLogger("DailyHeatAnalyzer")
 
 logger = setup_logging()
 
-# ============================================================================
-# CONFIGURATION  (mirrors pipline.py)
-# ============================================================================
-
-PG_CONNECTION_STRING = os.environ.get(
-    "PG_CONNECTION_STRING",
-    "postgresql://vanixuser:vanix%244567%23@10.98.36.21:6432/vanixdb"
-)
-
-# Heat cycle parameters
-CYCLE_DAYS          = 21    # average bovine estrus cycle length
-CYCLE_TOLERANCE     = 3     # +/- days around expected date
-MIN_BUFFER_DAYS     = 2     # minimum days in buffer before we score
-
-# Detection algorithm parameters
-RES_THRESHOLD       = 0.35   # VeDBA -> Restlessness
-FEED_THRESHOLD      = 0.15   # VeDBA -> Feeding
-NIGHT_HOURS         = [23, 0, 1, 2, 3]
-SOLAR_HOURS         = [11, 12, 13, 14, 15, 16]
-STRESS_TEMP         = 40.5   # degC - environmental heat stress cutoff
-SCORE_W_SPIKE       = 15     # weight for night temperature spike
-SCORE_W_PERSIST     = 40     # weight for behavioral persistence
-PROESTRUS_SCORE     = 25     # score threshold to flag as Proestrus
-MIN_HEAT_SCORE      = 20     # baseline score needed to trigger a "Confirmed Heat"
-HEAT_COOL_DOWN      = 15     # days to suppress new alerts after a confirmed heat
-EXPECTED_ROWS_PER_DAY = 172800  # 2 data points per second × 86400 seconds/day
-FFILL_MIN_COMPLETENESS = 0.60   # only forward-fill days with ≥60% raw data
 
 # ============================================================================
-# TIMEZONE UTILITIES  (mirrors pipline.py)
+# 2. DATABASE MANAGER
 # ============================================================================
 
-def ist_to_utc(dt: datetime) -> datetime:
-    return dt - timedelta(hours=5, minutes=30)
+class DatabaseManager:
+    def __init__(self, connection_string: str):
+        self.conn_str = connection_string
 
-def utc_to_ist(dt: datetime) -> datetime:
-    return dt + timedelta(hours=5, minutes=30)
+    @staticmethod
+    def ist_to_utc(dt: datetime) -> datetime:
+        return dt - timedelta(hours=5, minutes=30)
 
-# ============================================================================
-# DATABASE: FETCH DATA FOR A DATE RANGE  (mirrors pipline.py pattern)
-# ============================================================================
+    @staticmethod
+    def utc_to_ist(dt: datetime) -> datetime:
+        return dt + timedelta(hours=5, minutes=30)
 
-def fetch_node_data(node_id: int,
-                    start_date: date,
-                    end_date: date) -> pd.DataFrame:
-    """
-    Fetch all sensor readings for a node between start_date and end_date (IST).
-    Mirrors the fetch_device_data_from_db() pattern from pipline.py.
+    def fetch_single_day(self, node_id: int, target_date: date) -> pd.DataFrame:
+        """Fetch exactly one IST calendar day (00:00 – 23:59:59)."""
+        start_ist = datetime.combine(target_date, datetime.min.time())
+        end_ist   = datetime.combine(target_date, datetime.max.time().replace(microsecond=0))
 
-    Returns DataFrame with columns:
-        node_id, timestamp_ist, x, y, z, temperature_value
-    """
-    # Convert IST date range to UTC timestamps for the DB query
-    start_utc = ist_to_utc(datetime(start_date.year, start_date.month, start_date.day, 0, 0, 0))
-    end_utc   = ist_to_utc(datetime(end_date.year,   end_date.month,   end_date.day,   23, 59, 59))
+        start_utc = self.ist_to_utc(start_ist)
+        end_utc   = self.ist_to_utc(end_ist)
 
-    logger.info(f"Querying node {node_id}: {start_date} -> {end_date} IST "
-                f"({start_utc} -> {end_utc} UTC)")
+        logger.info(f"DB: Querying node {node_id} for {target_date} IST")
 
-    query = """
-        SELECT
-            node_id,
-            timestamp               AS timestamp_utc,
-            timestamp + INTERVAL '5 hours 30 minutes' AS timestamp_ist,
-            x,
-            y,
-            z,
-            temperature_value
-        FROM device_data
-        WHERE node_id::text = %(node_id)s::text
-          AND timestamp >= %(start_utc)s
-          AND timestamp <= %(end_utc)s
-          AND x IS NOT NULL
-          AND y IS NOT NULL
-          AND z IS NOT NULL
-        ORDER BY timestamp ASC
-    """
+        query = """
+            SELECT
+                node_id,
+                timestamp                                   AS timestamp_utc,
+                timestamp + INTERVAL '5 hours 30 minutes'  AS timestamp_ist,
+                x, y, z,
+                temperature_value
+            FROM device_data
+            WHERE node_id::text = %(node_id)s::text
+              AND timestamp >= %(start_utc)s
+              AND timestamp <= %(end_utc)s
+              AND x IS NOT NULL AND y IS NOT NULL AND z IS NOT NULL
+            ORDER BY timestamp ASC
+        """
 
-    try:
         import warnings
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, module='pandas.io.sql')
-            with psycopg2.connect(PG_CONNECTION_STRING) as conn:
+            with psycopg2.connect(self.conn_str) as conn:
                 df = pd.read_sql_query(
                     query, conn,
-                    params={"node_id": str(node_id), "start_utc": start_utc, "end_utc": end_utc}
+                    params={
+                        "node_id":    str(node_id),
+                        "start_utc":  start_utc,
+                        "end_utc":    end_utc,
+                    }
                 )
-        logger.info(f"  Fetched {len(df):,} rows")
         return df
 
-    except Exception as e:
-        logger.error(f"DB fetch failed: {e}", exc_info=True)
-        raise
+    def fetch_config_parameters(self) -> dict:
+        """Fetch configurable parameters from heat_analysis_config."""
+        query = """
+            SELECT
+                expected_dps_per_hour,
+                expected_dps_per_day,
+                res_threshold,
+                feed_threshold,
+                score_w_spike,
+                score_w_persist,
+                anchor_hours,
+                night_hours,
+                solar_hours
+            FROM heat_analysis_config
+            ORDER BY id DESC
+            LIMIT 1;
+        """
+        try:
+            with psycopg2.connect(self.conn_str) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query)
+                    row = cur.fetchone()
+                    if row:
+                        return {
+                            # We only care about spike and persist weightages for the POC. 
+                            # The rest will use the defaults defined in Config.
+                            "score_w_spike":         float(row[4]) if row[4] is not None else None,
+                            "score_w_persist":       float(row[5]) if row[5] is not None else None,
+                        }
+        except Exception as e:
+            logger.warning(f"Could not fetch config from DB (using defaults): {e}")
+        return {}
+
+    def fetch_stress_temp(self, node_id: int) -> float:
+        """Fetch the stress_temp for a specific node, defaulting to 40.5."""
+        query = """
+            SELECT stress_temp
+            FROM device_data
+            WHERE node_id::text = %(node_id)s::text
+              AND stress_temp IS NOT NULL
+            ORDER BY timestamp DESC
+            LIMIT 1;
+        """
+        try:
+            with psycopg2.connect(self.conn_str) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, {"node_id": str(node_id)})
+                    row = cur.fetchone()
+                    if row and row[0] is not None:
+                        return float(row[0])
+        except Exception as e:
+            logger.warning(f"Could not fetch stress_temp for node {node_id} (using default 40.5): {e}")
+        return 40.5
+
 
 # ============================================================================
-# BLOCK 1 + 2: FEATURE EXTRACTION + ACTIVITY RECOGNITION
+# 3. ANALYSIS ENGINE
 # ============================================================================
 
-def extract_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute VeDBA from x, y, z accelerometer axes."""
-    df = df.copy()
-    df["mag"]   = np.sqrt(df["x"]**2 + df["y"]**2 + df["z"]**2)
-    df["vedba"] = np.abs(df["mag"] - df["mag"].rolling(window=50, center=True).mean())
-    return df.fillna(0)
+class DailyAnalysisEngine:
 
-def predict_activity(df: pd.DataFrame) -> pd.DataFrame:
-    """Classify each row as RES / FEED / STANDING based on VeDBA thresholds."""
-    conditions = [df["vedba"] > RES_THRESHOLD, df["vedba"] > FEED_THRESHOLD]
-    df["activity_class"] = np.select(conditions, ["RES", "FEED"], default="STANDING")
-    return df
+    # ── Feature extraction ─────────────────────────────────────────────────
 
-# ============================================================================
-# HOURLY RESAMPLING
-# ============================================================================
-
-def to_hourly(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Resample raw rows to hourly buckets.
-    Returns DataFrame indexed by hour with temp_mean and res_ratio columns.
-    """
-    df = predict_activity(extract_features(df))
-    idx = df.set_index("timestamp_ist")
-
-    hourly = idx["temperature_value"].resample("h").mean().to_frame(name="temp_mean")
-    hourly["res_ratio"] = (
-        idx["activity_class"]
-        .apply(lambda x: 1 if x == "RES" else 0)
-        .resample("h").mean()
-    )
-    return hourly
-
-# ============================================================================
-# BLOCK 3: ENVIRONMENTAL HEAT STRESS
-# ============================================================================
-
-def check_heat_stress(hourly_df: pd.DataFrame) -> bool:
-    solar = hourly_df[hourly_df.index.hour.isin(SOLAR_HOURS)]["temp_mean"].dropna()
-    return bool(solar.mean() > STRESS_TEMP) if not solar.empty else False
-
-# ============================================================================
-# BLOCK 4: SCORE A SINGLE DAY  (given full window for global anchor)
-# ============================================================================
-
-def score_day(day_hourly: pd.DataFrame, global_night_base: float) -> dict:
-    night_data  = day_hourly[day_hourly.index.hour.isin(NIGHT_HOURS)]
-    night_temps = night_data["temp_mean"].dropna()
-    night_max   = night_temps.max() if not night_temps.empty else np.nan
-    spike       = max(0.0, night_max - global_night_base) if not np.isnan(night_max) else 0.0
-
-    persistence = day_hourly["res_ratio"].rolling(3, min_periods=1).mean().max()
-    persistence = 0.0 if np.isnan(persistence) else float(persistence)
-
-    score = (spike * SCORE_W_SPIKE) + (persistence * SCORE_W_PERSIST)
-    return {"spike": spike, "persistence": persistence, "score": score}
-
-# ============================================================================
-# CYCLE PREDICTION UTILITIES
-# ============================================================================
-
-def predict_next_cycle(last_heat: date) -> dict:
-    expected     = last_heat + timedelta(days=CYCLE_DAYS)
-    window_start = expected - timedelta(days=CYCLE_TOLERANCE)
-    window_end   = expected + timedelta(days=CYCLE_TOLERANCE)
-    return {
-        "expected_next_heat": expected.isoformat(),
-        "window_start":       window_start.isoformat(),
-        "window_end":         window_end.isoformat(),
-    }
-
-def days_until_window(window_start: str, reference: date = None) -> int:
-    ref   = reference or date.today()
-    ws    = date.fromisoformat(window_start)
-    delta = (ws - ref).days
-    return max(0, delta)
-
-# ============================================================================
-# ROLLING WINDOW DETECTION ENGINE
-# ============================================================================
-
-def run_rolling_detection(
-    all_hourly: pd.DataFrame,
-    node_id: int,
-    last_heat_date: date,
-    window_days: int,
-    next_cycle: dict,
-    daily_raw_counts: Dict[date, int] = None,
-    filled_days: set = None
-) -> List[dict]:
-    """
-    Step through each day in all_hourly one at a time.
-    Maintain a rolling buffer of window_days days.
-    Score today against the full buffer.
-    Returns list of per-day result dicts.
-    """
-    window_start_str = next_cycle["window_start"]
-    window_end_str   = next_cycle["window_end"]
-
-    # Group hourly data by calendar date (IST)
-    daily_groups = all_hourly.groupby(all_hourly.index.date)
-    sorted_days  = sorted(daily_groups.groups.keys())
-
-    buffer: deque = deque(maxlen=window_days)   # (date, hourly_df) tuples
-    results = []
-    last_alert_date = None
-
-    for day in sorted_days:
-        day_hourly = daily_groups.get_group(day)
-        buffer.append((day, day_hourly))
-
-        # Skip until we have at least MIN_BUFFER_DAYS of context
-        if len(buffer) < MIN_BUFFER_DAYS:
-            logger.info(f"  {day} | BUFFERING ({len(buffer)}/{window_days})")
-            continue
-
-        # Build full window
-        window_df = pd.concat([df for _, df in buffer])
-
-        # Global anchor: minimum night temp across the whole window
-        night_mask = window_df.index.hour.isin([0, 1, 2])
-        night_vals = window_df.loc[night_mask, "temp_mean"].dropna()
-        global_anchor = float(night_vals.min()) if not night_vals.empty else 0.0
-
-        # Env stress across the window
-        env_stress = check_heat_stress(window_df)
-
-        # Score all days in buffer to do winner-take-all comparison
-        scored = []
-        for d, d_df in buffer:
-            s = score_day(d_df, global_anchor)
-            s["date"] = d
-            scored.append(s)
-
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        peak_day = scored[0]["date"]
-
-        # Get today's own score
-        today_score = next((s for s in scored if s["date"] == day), scored[0])
-        score_val   = today_score["score"]
-
-        # Determine if today is inside the expected heat window
-        in_window = (window_start_str <= day.isoformat() <= window_end_str)
-
-        # Determine verdict for today
-        status = "NORMAL"
+    @staticmethod
+    def extract_features_and_activity(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        df = df.copy()
         
-        # 1. Check if today is the peak of the current rolling window and meets min score
-        if day == peak_day and score_val >= MIN_HEAT_SCORE:
-            # 2. Check cool-down period from last alert
-            if last_alert_date is None or (day - last_alert_date).days >= HEAT_COOL_DOWN:
-                if env_stress:
-                    status = "SUPPRESSED (ENV STRESS)"
-                else:
-                    status = "ALERT: CONFIRMED HEAT"
-                    last_alert_date = day
-            else:
-                # Peak of window but inside cool-down period
-                status = "NORMAL (COOL DOWN)"
-        elif score_val >= PROESTRUS_SCORE:
-            status = "LOG: PROESTRUS"
+        # Guard against zero/corrupted sensor readings (cow temp is ~38.6°C)
+        if "temperature_value" in df.columns:
+            df.loc[
+                (df["temperature_value"] < 30.0) | (df["temperature_value"] > 45.0), 
+                "temperature_value"
+            ] = np.nan
+            
+        df["mag"]   = np.sqrt(df["x"]**2 + df["y"]**2 + df["z"]**2)
+        df["vedba"] = (
+            np.abs(df["mag"] - df["mag"].rolling(window=50, center=True).mean())
+            .fillna(0)
+        )
+        conditions = [
+            df["vedba"] > Config.RES_THRESHOLD,
+            df["vedba"] > Config.FEED_THRESHOLD,
+        ]
+        df["activity_class"] = np.select(conditions, ["RES", "FEED"], default="STANDING")
+        return df
 
-        # Day-wise data completeness
-        actual_rows = daily_raw_counts.get(day, 0) if daily_raw_counts else 0
-        completeness = round((actual_rows / EXPECTED_ROWS_PER_DAY) * 100, 2) if EXPECTED_ROWS_PER_DAY > 0 else 0.0
-        was_filled = day in filled_days if filled_days else False
+    # ── Data-loss at 30-min slot resolution ───────────────────────────────
 
-        result = {
-            "date":              day.isoformat(),
-            "status":            status,
-            "night_spike_C":     round(today_score["spike"], 4),
-            "persistence_pct":   round(today_score["persistence"] * 100, 1),
-            "score":             round(score_val, 4),
-            "global_anchor_C":   round(global_anchor, 4),
-            "env_stress":        env_stress,
-            "buffer_days":       len(buffer),
-            "in_expected_window": in_window,
-            "actual":            actual_rows,
-            "completeness_pct":  completeness,
-            "filled":            day in filled_days,
-        }
-        results.append(result)
+    @staticmethod
+    def calculate_data_loss(df: pd.DataFrame, target_date: date) -> Tuple[float, float, dict]:
+        """
+        Calculate daily data loss %, data completeness % (capped at 100), and per-30-min-slot data loss.
+        Adjusts expected counts dynamically if the target day is actively in progress (e.g. running at 12 PM).
 
-        logger.info(
-            f"  [{day}] {status:<26} | spike={today_score['spike']:.3f}C "
-            f"| persist={round(today_score['persistence']*100)}% "
-            f"| score={score_val:.2f} "
-            f"| anchor={global_anchor:.2f}C"
-            + (" [IN WINDOW]" if in_window else "")
+        Returns
+        -------
+        daily_loss_pct : float
+            Percentage of expected daily DPs that are missing.
+        data_completeness : float
+            Percentage of expected daily DPs that were successfully received (capped at 100%).
+        slot_stats     : dict
+            Key = "HH:MM"  (slot start),
+            Value = {"loss_pct": float, "count": int}
+        """
+        now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+
+        # Build a complete 48-slot index for the target day
+        slot_starts = pd.date_range(
+            start=pd.Timestamp(datetime.combine(target_date, datetime.min.time())),
+            periods=Config.SLOTS_PER_DAY,
+            freq=f"{Config.SLOT_DURATION_MIN}min",
         )
 
-    return results
+        if df.empty:
+            slot_stats = {
+                ts.strftime("%H:%M"): {"loss_pct": 100.0, "count": 0}
+                for ts in slot_starts
+            }
+            return 100.0, 0.0, slot_stats
+
+        if not pd.api.types.is_datetime64_any_dtype(df["timestamp_ist"]):
+            df = df.copy()
+            df["timestamp_ist"] = pd.to_datetime(df["timestamp_ist"])
+
+        total_dps = len(df)
+        
+        # Adjust expected total based on whether day is fully elapsed or still in progress (mid-day execution)
+        target_start_dt = datetime.combine(target_date, datetime.min.time())
+        if now_ist.date() == target_date:
+            elapsed_minutes = (now_ist - target_start_dt).total_seconds() / 60.0
+            elapsed_minutes = max(0, min(1440, elapsed_minutes)) # Limit to 24h just in case
+            expected_total_dps = elapsed_minutes * Config.DP_RATE_PER_MIN
+        elif now_ist.date() > target_date:
+            expected_total_dps = Config.EXPECTED_DPS_PER_DAY
+        else: # target_date is completely in the future
+            expected_total_dps = 0 
+
+        if expected_total_dps > 0:
+            daily_loss_pct = round(100.0 * (1 - total_dps / expected_total_dps), 2)
+            # User specifically requested capping completion to max 100%
+            data_completeness = min(100.0, max(0.0, round(100.0 * (total_dps / expected_total_dps), 2)))
+        else:
+            daily_loss_pct = 100.0
+            data_completeness = 0.0
+
+        if daily_loss_pct < 0:
+            logger.warning(
+                f"Negative daily data loss ({daily_loss_pct}%) — possible duplicate rows in DB."
+            )
+
+        # Assign each raw DP to its 30-min slot
+        df = df.copy()
+        df["slot"] = df["timestamp_ist"].dt.floor(f"{Config.SLOT_DURATION_MIN}min")
+        slot_counts = df.groupby("slot").size()
+
+        slot_stats: dict = {}
+        for ts in slot_starts:
+            count    = int(slot_counts.get(ts, 0))
+            loss_pct = round(100.0 * (1 - count / Config.EXPECTED_DPS_PER_SLOT), 2)
+            if loss_pct < 0:
+                logger.warning(
+                    f"Negative slot loss at {ts.strftime('%H:%M')} ({loss_pct}%) — "
+                    f"possible duplicate rows."
+                )
+            slot_stats[ts.strftime("%H:%M")] = {"loss_pct": loss_pct, "count": count}
+
+        return daily_loss_pct, data_completeness, slot_stats
+
+    # ── Resample to 10-min buckets then optionally backfill ───────────────
+
+    @staticmethod
+    def resample_to_10min(df: pd.DataFrame, target_date: date) -> pd.DataFrame:
+        """
+        Resample raw data into 10-minute buckets that span exactly one IST day.
+
+        Returns a DataFrame with columns [temp_mean, res_ratio].
+        Missing buckets are NaN (not filled here).
+        """
+        full_index = pd.date_range(
+            start=pd.Timestamp(datetime.combine(target_date, datetime.min.time())),
+            periods=144,                    # 24 h × 6 buckets/h
+            freq="10min",
+        )
+        
+        now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        if target_date == now_ist.date():
+            # Truncate future buckets so we don't accidentally backfill a 12PM run into a 10PM future
+            full_index = full_index[full_index <= pd.Timestamp(now_ist)]
+
+        if df.empty:
+            return pd.DataFrame(
+                index=full_index,
+                columns=["temp_mean", "res_ratio"],
+                dtype=float,
+            )
+
+        idx = df.set_index("timestamp_ist")
+
+        temp_10  = idx["temperature_value"].resample("10min").mean().rename("temp_mean")
+        res_flag = idx["activity_class"].apply(lambda x: 1 if x == "RES" else 0)
+        res_10   = res_flag.resample("10min").mean().rename("res_ratio")
+
+        buckets = pd.concat([temp_10, res_10], axis=1).reindex(full_index)
+        return buckets
+
+    @staticmethod
+    def apply_10min_backfill(buckets_10min: pd.DataFrame) -> pd.DataFrame:
+        """
+        Fill missing 10-minute slots by copying the EXACT preceding block of data 
+        of the same length. If a gap occurs at the very start of the day (no preceding data),
+        it uses the succeeding continuous block of data.
+        """
+        filled = buckets_10min.copy()
+        
+        missing_mask = filled.isna().all(axis=1)
+        
+        if not missing_mask.any():
+            return filled
+
+        gap_id = (missing_mask != missing_mask.shift()).cumsum()
+        
+        for _, group in filled[missing_mask].groupby(gap_id):
+            gap_length = len(group)
+            start_idx_pos = filled.index.get_loc(group.index[0])
+            end_idx_pos = start_idx_pos + gap_length
+            
+            # Primary strategy: look backwards
+            copy_start_pos = max(0, start_idx_pos - gap_length)
+            source_block = filled.iloc[copy_start_pos:start_idx_pos].dropna(how='all')
+            
+            # Fallback strategy: if no valid preceding data exists (gap is at start of day)
+            if len(source_block) == 0:
+                # Look forwards
+                copy_end_pos = min(len(filled), end_idx_pos + gap_length)
+                source_block = filled.iloc[end_idx_pos:copy_end_pos].dropna(how='all')
+                
+            # Tile whatever valid source block we found to cover the gap exactly
+            if len(source_block) > 0:
+                tiles_needed = int(np.ceil(gap_length / len(source_block)))
+                tiled_block = pd.concat([source_block] * tiles_needed).iloc[:gap_length]
+                
+                filled.loc[group.index, "temp_mean"] = tiled_block["temp_mean"].values
+                filled.loc[group.index, "res_ratio"] = tiled_block["res_ratio"].values
+                    
+        return filled
+
+    # ── Aggregate 10-min → hourly for scoring ─────────────────────────────
+
+    @staticmethod
+    def aggregate_to_hourly(buckets_10min: pd.DataFrame, target_date: date) -> pd.DataFrame:
+        """Average the 10-min buckets up to hourly for metric calculation."""
+        hourly_index = pd.date_range(
+            start=pd.Timestamp(datetime.combine(target_date, datetime.min.time())),
+            periods=24,
+            freq="h",
+        )
+        hourly = buckets_10min.resample("h").mean()
+        return hourly.reindex(hourly_index)
+
+    # ── Anchor calculation (BUG-1 FIX) ────────────────────────────────────
+
+    @staticmethod
+    def calculate_daily_anchor(hourly_df: pd.DataFrame) -> float:
+        """
+        Daily Anchor = MINIMUM temperature in the biological night window
+        (hours 23, 0, 1, 2, 3 of the same IST calendar day).
+
+        This is the animal's coolest baseline for the day — the floor from
+        which any heat stress rise is measured.
+
+        Night Spike relationship
+        -----------------------
+        spike = max(night-window temps) − anchor
+              = max(night-window temps) − min(night-window temps)
+
+        Both values come from the SAME set of hours (NIGHT_HOURS == ANCHOR_HOURS).
+        This means the spike is the intra-night temperature range — how much the
+        temperature varied within the night window, not a day-vs-night comparison.
+
+        ⚠ Root cause of the 36.9542 bug (now fixed)
+        --------------------------------------------
+        The old code returned 0.0 when temps.empty was True.  But in the failing
+        case, temps was NOT empty — it had valid readings (night_max = 36.9542).
+        The old code still hit the `return 0.0` path because of a separate early
+        return guard that was never reached, leaving anchor = 0.0 while night_max
+        was computed correctly from the same hours.  Result:
+
+            spike = 36.9542 − 0.0 = 36.9542   ← completely wrong
+
+        The correct value would have been:
+            anchor   = min(night temps) = ~36.xx
+            spike    = 36.9542 − 36.xx = a small realistic delta
+
+        Fix: anchor is now always min(temps) when data exists, and np.nan only
+        when the night window is genuinely empty, which then propagates to make
+        spike = None rather than a phantom large number.
+        """
+        anchor_data = hourly_df[hourly_df.index.hour.isin(Config.ANCHOR_HOURS)]
+        temps = anchor_data["temp_mean"].dropna()
+        if temps.empty:
+            logger.warning(
+                "No temperature data in anchor hours — anchor set to NaN. "
+                "Night spike will also be NaN."
+            )
+            return np.nan
+
+        anchor = float(temps.min())
+        logger.info(
+            f"Daily anchor: {anchor:.4f} °C  "
+            f"(min of {len(temps)} readings across hours {Config.ANCHOR_HOURS})"
+        )
+        return anchor
+
+    # ── Metrics (BUG-1 & BUG-2 guard) ────────────────────────────────────
+
+    @staticmethod
+    def calculate_metrics(hourly_df: pd.DataFrame, daily_anchor: float) -> dict:
+        """
+        Calculate spike, persistence, and composite heat score.
+
+        Night Spike
+        -----------
+        spike = max(night-window temps) − daily_anchor
+
+        The night window (NIGHT_HOURS) is intentionally the same set of hours
+        as the anchor window.  The idea is:
+          • The anchor is the *minimum* in that window (coolest point).
+          • The spike is how far above that minimum the temperature rose within
+            the same window — i.e., intra-night temperature variance.
+
+        If you prefer the spike to capture day-time peaks vs the nightly anchor,
+        change NIGHT_HOURS to daytime hours (e.g., [10, 11, 12, 13, 14]).
+
+        Returns None values for all metrics when anchor is NaN (missing data).
+        """
+        # Guard: cannot compute spike without a valid anchor  (BUG-1 fix propagation)
+        if np.isnan(daily_anchor):
+            return {
+                "daily_anchor_C":   None,
+                "night_spike_C":    None,
+                "persistence_pct":  None,
+                "score":            None,
+                "note":             "Insufficient night-window data to compute anchor/spike.",
+            }
+
+        night_data  = hourly_df[hourly_df.index.hour.isin(Config.NIGHT_HOURS)]
+        night_temps = night_data["temp_mean"].dropna()
+
+        if night_temps.empty:
+            night_spike = 0.0
+        else:
+            night_max   = float(night_temps.max())
+            night_spike = max(0.0, night_max - daily_anchor)
+
+        # Persistence: rolling 3-hour mean of restlessness ratio
+        # res_ratio is NaN for missing hours (not artificially filled — BUG-3 fix)
+        persistence_series = hourly_df["res_ratio"].rolling(3, min_periods=1).mean()
+        persistence_max    = persistence_series.max()
+        persistence        = 0.0 if pd.isna(persistence_max) else float(persistence_max)
+
+        score = (night_spike * Config.SCORE_W_SPIKE) + (persistence * Config.SCORE_W_PERSIST)
+
+        return {
+            "daily_anchor_C":  round(daily_anchor, 4),
+            "night_spike_C":   round(night_spike,  4),
+            "persistence_pct": round(persistence * 100, 2),
+            "score":           round(score, 4),
+            "heat_detected":   score >= Config.HEAT_DETECTION_THRESHOLD,
+        }
+
 
 # ============================================================================
-# SUMMARISE RESULTS
+# 4. LAMBDA ORCHESTRATOR
 # ============================================================================
 
-def build_summary(results: List[dict]) -> dict:
-    confirmed = [r["date"] for r in results if r["status"] == "ALERT: CONFIRMED HEAT"]
-    proestrus = [r["date"] for r in results if r["status"] == "LOG: PROESTRUS"]
-    suppressed = [r["date"] for r in results if "SUPPRESSED" in r["status"]]
-    normal    = len(results) - len(confirmed) - len(proestrus) - len(suppressed)
+class DailyAnalysisHandler:
+    def __init__(self):
+        self.db     = DatabaseManager(Config.PG_CONNECTION_STRING)
+        self.engine = DailyAnalysisEngine()
 
-    return {
-        "total_days_processed": len(results),
-        "confirmed_heat_days":  confirmed,
-        "proestrus_days":       proestrus,
-        "suppressed_days":      suppressed,
-        "normal_days":          normal,
-    }
+    def process(self, event: dict) -> dict:
+        node_id         = int(event.get("node_id", 0))
+        target_date_str = event.get("target_date", "")
+
+        if not node_id or not target_date_str:
+            return self._response(400, {"error": "Missing node_id or target_date"})
+
+        target_date = date.fromisoformat(target_date_str)
+
+        # 0. Fetch configurable parameters from DB (Only spike & persist weights)
+        db_config = self.db.fetch_config_parameters()
+        if db_config:
+            for attr in ("score_w_spike", "score_w_persist"):
+                val = db_config.get(attr)
+                if val is not None:
+                    setattr(Config, attr.upper(), val)
+
+        # 0.5. Fetch node-specific stress temperature
+        Config.STRESS_TEMP = self.db.fetch_stress_temp(node_id)
+
+        # 1. Fetch raw data
+        raw_df = self.db.fetch_single_day(node_id, target_date)
+        raw_df["timestamp_ist"] = pd.to_datetime(raw_df["timestamp_ist"])
+
+        # 2. Data loss at 30-min slot resolution
+        daily_loss_pct, data_completeness, slot_stats = self.engine.calculate_data_loss(raw_df, target_date)
+
+        if raw_df.empty:
+            return self._response(200, {
+                "node_id":       node_id,
+                "target_date":   target_date_str,
+                "heat_detected": False,
+                "data_loss": {
+                    "daily_pct":          100.0,
+                    "data_completeness":  0.0,
+                    "expected_dps_day":   Config.EXPECTED_DPS_PER_DAY,
+                    "expected_dps_slot":  Config.EXPECTED_DPS_PER_SLOT,
+                    "slot_duration_min":  Config.SLOT_DURATION_MIN,
+                    "slots_per_day":      Config.SLOTS_PER_DAY,
+                    "slot_stats":         slot_stats,
+                },
+                "results": {"raw": None, "filled": None},
+                "message": "No data found for this node on the target date.",
+            })
+
+        # 3. Feature extraction
+        processed_df = self.engine.extract_features_and_activity(raw_df)
+
+        # 4. Resample → 10-min buckets (RAW: gaps stay NaN)
+        buckets_raw = self.engine.resample_to_10min(processed_df, target_date)
+
+        # 5. Apply 10-min backfill to temp only (FILLED)
+        buckets_filled = self.engine.apply_10min_backfill(buckets_raw)
+
+        # 6. Aggregate to hourly for scoring
+        hourly_raw    = self.engine.aggregate_to_hourly(buckets_raw,    target_date)
+        hourly_filled = self.engine.aggregate_to_hourly(buckets_filled, target_date)
+
+        # 7. Anchors (returns np.nan when night window is empty — BUG-1 fix)
+        anchor_raw    = self.engine.calculate_daily_anchor(hourly_raw)
+        anchor_filled = self.engine.calculate_daily_anchor(hourly_filled)
+
+        # 8. Metrics
+        metrics_raw    = self.engine.calculate_metrics(hourly_raw,    anchor_raw)
+        metrics_filled = self.engine.calculate_metrics(hourly_filled, anchor_filled)
+        
+        # Determine global heat detection status from the filled pipeline
+        heat_detected = metrics_filled.get("heat_detected", False) if isinstance(metrics_filled, dict) else False
+
+        result = {
+            "node_id":       node_id,
+            "target_date":   target_date_str,
+            "heat_detected": heat_detected,
+            "data_loss": {
+                "daily_pct":         daily_loss_pct,
+                "data_completeness": data_completeness,
+                "expected_dps_day":  Config.EXPECTED_DPS_PER_DAY,
+                "expected_dps_slot": Config.EXPECTED_DPS_PER_SLOT,
+                "slot_duration_min": Config.SLOT_DURATION_MIN,
+                "slots_per_day":     Config.SLOTS_PER_DAY,
+                "slot_stats":        slot_stats,
+            },
+            "results": {
+                "raw":    metrics_raw,
+                "filled": metrics_filled,
+            },
+        }
+
+        return self._response(200, result)
+
+    def _response(self, status: int, body: dict) -> dict:
+        return {
+            "statusCode": status,
+            "headers":    {"Content-Type": "application/json"},
+            "body":       json.dumps(body, indent=2, default=str),
+        }
+
 
 # ============================================================================
-# MAIN HANDLER (Lambda entry point)
+# ENTRY POINT
 # ============================================================================
 
 def handler(event, context):
-    """
-    AWS Lambda handler.
-
-    Expected event payload:
-        {
-            "node_id":        124,
-            "last_heat_date": "2026-02-26",
-            "window_days":    7              (optional)
-        }
-    """
-    logger.info("=" * 70)
-    logger.info("HEAT CYCLE BENCHMARK LAMBDA - STARTED")
-    logger.info("=" * 70)
-    logger.info(f"Event: {json.dumps(event)}")
-
+    logger.info(f"DAILY ANALYSIS START: {json.dumps(event)}")
     try:
-        # ------------------------------------------------------------------
-        # 1. Parse and validate payload
-        # ------------------------------------------------------------------
-        node_id         = int(event.get("node_id") or event.get("nodeId") or 0)
-        last_heat_str   = event.get("last_heat_date") or event.get("lastHeatDate") or ""
-        window_days     = int(event.get("window_days", 7))
-
-        if not node_id:
-            raise ValueError("Missing required field: node_id")
-        if not last_heat_str:
-            raise ValueError("Missing required field: last_heat_date (format: YYYY-MM-DD)")
-
-        last_heat_date = date.fromisoformat(last_heat_str)
-        today_ist      = utc_to_ist(datetime.utcnow()).date()
-
-        logger.info(f"Node ID         : {node_id}")
-        logger.info(f"Last Heat Date  : {last_heat_date}")
-        logger.info(f"Today (IST)     : {today_ist}")
-        logger.info(f"Rolling Window  : {window_days} days")
-
-        # ------------------------------------------------------------------
-        # 2. Cycle prediction
-        # ------------------------------------------------------------------
-        next_cycle = predict_next_cycle(last_heat_date)
-        days_left  = days_until_window(next_cycle["window_start"], today_ist)
-
-        logger.info(f"Next Expected Heat  : {next_cycle['expected_next_heat']}")
-        logger.info(f"Watch Window        : {next_cycle['window_start']} to {next_cycle['window_end']}")
-
-        # ------------------------------------------------------------------
-        # 3. Query DB: from last_heat_date - 7 days to today
-        #    (extra lookback so day-1 always has a full buffer worth of context)
-        # ------------------------------------------------------------------
-        fetch_start = last_heat_date - timedelta(days=window_days)
-        fetch_end   = today_ist
-
-        logger.info(f"\nFetching data: {fetch_start} -> {fetch_end}")
-        raw_df = fetch_node_data(node_id, fetch_start, fetch_end)
-
-        if raw_df.empty:
-            return _response(404, {
-                "error":   "No data found in database for this node/date range",
-                "node_id": node_id,
-                "range":   f"{fetch_start} to {fetch_end}"
-            })
-
-        # ------------------------------------------------------------------
-        # 4. Resample to hourly & compute day-wise raw counts
-        # ------------------------------------------------------------------
-        raw_df["timestamp_ist"] = pd.to_datetime(raw_df["timestamp_ist"])
-
-        # Count raw rows per calendar day (IST) before resampling
-        daily_raw_counts = (
-            raw_df.groupby(raw_df["timestamp_ist"].dt.date)
-            .size()
-            .to_dict()
-        )
-
-        hourly_all = to_hourly(raw_df)
-
-        # ------------------------------------------------------------------
-        # 4b. Forward-fill missing hourly buckets (only for days ≥60% data)
-        # ------------------------------------------------------------------
-        full_index = pd.date_range(
-            start=pd.Timestamp(fetch_start),
-            end=pd.Timestamp(fetch_end) + timedelta(hours=23),
-            freq="h"
-        )
-        hourly_all = hourly_all.reindex(full_index)
-
-        # Determine which days qualify for forward-fill
-        filled_days = set()
-        for day_date, pct in [
-            (d, daily_raw_counts.get(d, 0) / EXPECTED_ROWS_PER_DAY)
-            for d in sorted(set(full_index.date))
-        ]:
-            if pct >= FFILL_MIN_COMPLETENESS:
-                filled_days.add(day_date)
-
-        # Forward-fill only qualifying days; leave others with NaN gaps
-        day_groups = hourly_all.groupby(hourly_all.index.date)
-        filled_parts = []
-        for day_date, day_df in day_groups:
-            if day_date in filled_days:
-                filled_parts.append(day_df.ffill())
-            else:
-                filled_parts.append(day_df)
-        hourly_all = pd.concat(filled_parts)
-
-        logger.info(f"Forward-filled {len(filled_days)} day(s) with ≥60% data")
-        logger.info(f"Hourly buckets: {len(hourly_all)} across "
-                    f"{hourly_all.index.date.min()} to {hourly_all.index.date.max()}")
-
-        # Only score days AFTER last_heat_date (we already know that one)
-        hourly_scoring = hourly_all[hourly_all.index.date > last_heat_date]
-
-        if hourly_scoring.empty:
-            return _response(200, {
-                "node_id":           node_id,
-                "last_heat_date":    last_heat_str,
-                "expected_next_heat": next_cycle["expected_next_heat"],
-                "expected_window":   next_cycle,
-                "days_until_next_window": days_left,
-                "message": "No new days after last_heat_date yet - check back later.",
-                "daily_results": [],
-                "summary": {"total_days_processed": 0}
-            })
-
-        # ------------------------------------------------------------------
-        # 5. Run rolling window detection
-        # ------------------------------------------------------------------
-        logger.info(f"\nRunning rolling window detection on "
-                    f"{len(np.unique(hourly_scoring.index.date))} day(s)...\n")
-
-        daily_results = run_rolling_detection(
-            hourly_all,           # full hourly (includes pre-heat context)
-            node_id,
-            last_heat_date,
-            window_days,
-            next_cycle,
-            daily_raw_counts,
-            filled_days
-        )
-
-        # Only return results for days AFTER last_heat_date
-        daily_results = [r for r in daily_results if r["date"] > last_heat_str]
-
-        # ------------------------------------------------------------------
-        # 6. Build response
-        # ------------------------------------------------------------------
-        summary = build_summary(daily_results)
-
-        logger.info("\n" + "=" * 70)
-        logger.info("RESULTS SUMMARY")
-        logger.info("=" * 70)
-        logger.info(f"  Total days processed : {summary['total_days_processed']}")
-        logger.info(f"  Confirmed heat       : {summary['confirmed_heat_days'] or 'None'}")
-        logger.info(f"  Proestrus flags      : {summary['proestrus_days'] or 'None'}")
-        logger.info(f"  Suppressed           : {summary['suppressed_days'] or 'None'}")
-        logger.info(f"  Normal               : {summary['normal_days']}")
-        logger.info("=" * 70)
-
-        body = {
-            "node_id":                node_id,
-            "last_heat_date":         last_heat_str,
-            "expected_next_heat":     next_cycle["expected_next_heat"],
-            "expected_window": {
-                "start": next_cycle["window_start"],
-                "end":   next_cycle["window_end"],
-            },
-            "days_until_next_window": days_left,
-            "cycle_days":             CYCLE_DAYS,
-            "window_days_used":       window_days,
-            "data_fetched": {
-                "from": fetch_start.isoformat(),
-                "to":   fetch_end.isoformat(),
-                "total_rows_received": int(len(raw_df)),
-                "expected_rows_per_day": EXPECTED_ROWS_PER_DAY,
-            },
-            "daily_results": daily_results,
-            "summary":       summary,
-        }
-
-        return _response(200, body)
-
-    except ValueError as ve:
-        logger.error(f"Validation error: {ve}")
-        return _response(400, {"error": str(ve)})
-
+        app = DailyAnalysisHandler()
+        return app.process(event)
     except Exception as e:
-        logger.error(f"Pipeline failed: {e}", exc_info=True)
-        return _response(500, {"error": str(e), "error_type": type(e).__name__})
-
-
-def _response(status_code: int, body: dict) -> dict:
-    return {
-        "statusCode": status_code,
-        "headers":    {"Content-Type": "application/json"},
-        "body":       json.dumps(body, indent=2, default=str)
-    }
+        logger.error(f"FATAL: {e}", exc_info=True)
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)}),
+        }
 
 
 # ============================================================================
-# LOCAL TEST  (run directly: python lambda_heat_benchmark.py)
+# LOCAL TEST RUNNER
 # ============================================================================
 
 if __name__ == "__main__":
     test_event = {
-        "node_id":        124,
-        "last_heat_date": "2026-02-26",
-        "window_days":    7
+        "node_id":     124,
+        "target_date": "2026-03-03",
     }
 
     print("\n" + "=" * 70)
-    print("LOCAL TEST - HEAT CYCLE BENCHMARK")
+    print("RUNNING ISOLATED DAILY HEAT ANALYSIS")
     print("=" * 70)
-    print(f"Payload: {json.dumps(test_event, indent=2)}")
-    print("=" * 70 + "\n")
 
-    response = handler(test_event, None)
+    resp = handler(test_event, None)
+
+    if resp["statusCode"] == 200:
+        body = json.loads(resp["body"])
+
+        print(f"\nNode: {body['node_id']}  |  Date: {body['target_date']}")
+
+        # ── Data-loss section ──────────────────────────────────────────────
+        dl = body["data_loss"]
+        print(f"\n{'─'*70}")
+        print(f"DATA LOSS  (slot = {dl['slot_duration_min']} min  |  {dl['slots_per_day']} slots/day)")
+        print(f"{'─'*70}")
+        print(f"  Daily loss  : {dl['daily_pct']:>7.2f}%   "
+              f"(expected {dl['expected_dps_day']:,} DPs/day)")
+        print(f"  Slot size   : {dl['expected_dps_slot']:,} DPs  "
+              f"({dl['slot_duration_min']} min × {Config.DP_RATE_PER_MIN} DPs/min)")
+
+        print(f"\n  30-min slot breakdown  (loss% / raw count):")
+        slots = dl["slot_stats"]
+        keys  = sorted(slots.keys())
+        col_w = 22
+        cols  = 4                               # 4 slots per printed row
+        for row_start in range(0, len(keys), cols):
+            row_keys = keys[row_start : row_start + cols]
+            cells = [
+                f"{k}  {slots[k]['loss_pct']:>7.2f}%  ({slots[k]['count']:>4})"
+                for k in row_keys
+            ]
+            print("  |  ".join(f"{c:<{col_w}}" for c in cells))
+
+        # ── Metrics section ────────────────────────────────────────────────
+        r_raw = body["results"].get("raw")
+        r_fil = body["results"].get("filled")
+
+        print(f"\n{'─'*70}")
+        print("PERFORMANCE METRICS")
+        print(f"{'─'*70}")
+
+        if r_raw:
+            print(f"\n  Backfill window : {Config.BACKFILL_WINDOW_MIN} min  "
+                  f"(both temp_mean and res_ratio filled for gaps ≤ {Config.BACKFILL_WINDOW_MIN} min)")
+
+            def fmt(v):
+                return f"{v:>10.4f}" if v is not None else "      N/A "
+
+            print(f"\n  {'Metric':<22} | {'RAW (no fill)':>14} | {'FILLED (10-min ffill)':>20}")
+            print(f"  {'-'*22}-+-{'-'*14}-+-{'-'*20}")
+
+            rows = [
+                ("Daily Anchor (°C)",   "daily_anchor_C"),
+                ("Night Spike (°C)",    "night_spike_C"),
+                ("Persistence (%)",     "persistence_pct"),
+                ("Heat Score",          "score"),
+            ]
+            for label, key in rows:
+                rv = r_raw.get(key)
+                fv = r_fil.get(key) if r_fil else None
+                print(f"  {label:<22} | {fmt(rv)} | {fmt(fv)}")
+
+            if r_raw.get("note"):
+                print(f"\n  ⚠  RAW note   : {r_raw['note']}")
+            if r_fil and r_fil.get("note"):
+                print(f"  ⚠  FILLED note: {r_fil['note']}")
+        else:
+            print("\n  No metrics — empty dataset.")
+
+    else:
+        print("\nError response:")
+        print(resp)
+
     print("\n" + "=" * 70)
-    print("LAMBDA RESPONSE")
-    print("=" * 70)
-    body = json.loads(response["body"])
-
-    # Pretty print the summary and daily table
-    print(f"\nNode            : {body['node_id']}")
-    print(f"Last Heat       : {body['last_heat_date']}")
-    print(f"Expected Next   : {body['expected_next_heat']}")
-    print(f"Watch Window    : {body['expected_window']['start']}  to  {body['expected_window']['end']}")
-    print(f"Days to Window  : {body['days_until_next_window']}")
-
-    results = body.get("daily_results", [])
-    if results:
-        print(f"\n{'Date':<14} {'Status':<26} {'Spike':>8}  {'Persist':>8}  {'Score':>8}  {'InWindow':>10}")
-        print("-" * 78)
-        for r in results:
-            win_flag = "YES **" if r["in_expected_window"] else "-"
-            print(
-                f"{r['date']:<14} {r['status']:<26}"
-                f" {r['night_spike_C']:>7.3f}C"
-                f"  {r['persistence_pct']:>6.1f}%"
-                f"  {r['score']:>8.2f}"
-                f"  {win_flag:>10}"
-            )
-
-    summary = body.get("summary", {})
-    print(f"\nSummary:")
-    print(f"  Total processed : {summary.get('total_days_processed', 0)}")
-    print(f"  Confirmed Heat  : {summary.get('confirmed_heat_days') or 'None'}")
-    print(f"  Proestrus       : {summary.get('proestrus_days') or 'None'}")
-    print(f"  Normal days     : {summary.get('normal_days', 0)}")

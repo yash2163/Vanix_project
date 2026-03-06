@@ -11,6 +11,7 @@ COPY lambda_heat_benchmark.py ${LAMBDA_TASK_ROOT}
 COPY lambda_vpc_test.py ${LAMBDA_TASK_ROOT}
 COPY lambda_db_diagnostic.py ${LAMBDA_TASK_ROOT}
 COPY lambda_daily_heat_analysis.py ${LAMBDA_TASK_ROOT}
+COPY final_heat_detection_logic.py ${LAMBDA_TASK_ROOT}
 
 # Set the CMD to your handler
-CMD [ "lambda_daily_heat_analysis.handler" ]
+CMD [ "final_heat_detection_logic.handler" ]
